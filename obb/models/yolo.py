@@ -684,7 +684,7 @@ class Model(nn.Module):
     def fuse(self):  # fuse model Conv2d() + BatchNorm2d() layers
         LOGGER.info('Fusing layers... ')
         for m in self.model.modules():
-            if isinstance(m, (Conv, DWConv)) and hasattr(m, 'bn'):
+            if isinstance(m, (Conv, DWConv)) and hasattr(m, 'bn') and isinstance(m.bn, nn.BatchNorm2d):
                 m.conv = fuse_conv_and_bn(m.conv, m.bn)  # update conv
                 delattr(m, 'bn')  # remove batchnorm
                 m.forward = m.forward_fuse  # update forward
@@ -694,7 +694,7 @@ class Model(nn.Module):
             elif isinstance(m, RepConv_OREPA):
                 #print(f" switch_to_deploy")
                 m.switch_to_deploy()
-            elif type(m) is Conv and hasattr(m, 'bn'):
+            elif type(m) is Conv and hasattr(m, 'bn') and isinstance(m.bn, nn.BatchNorm2d):
                 m.conv = fuse_conv_and_bn(m.conv, m.bn)  # update conv
                 delattr(m, 'bn')  # remove batchnorm
                 m.forward = m.fuseforward  # update forward
@@ -729,12 +729,21 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
     layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
     for i, (f, n, m, args) in enumerate(d['backbone'] + d['head']):  # from, number, module, args
         m = eval(m) if isinstance(m, str) else m  # eval strings
+        kwargs = {}
+        args_ = []
         for j, a in enumerate(args):
             try:
-                args[j] = eval(a) if isinstance(a, str) else a  # eval strings
+                if isinstance(a, str):
+                    pos = a.find('=')
+                    if pos > 0:
+                        kwargs[a[:pos]] = eval(a[pos+1:])
+                    else:
+                        args_.append(eval(a))
+                else:
+                    args_.append(a)
             except:
-                pass
-
+                args_.append(a)
+        args = args_
         n = n_ = max(round(n * gd), 1) if n > 1 else n  # depth gain
         if m in [Conv, GhostConv, Bottleneck, GhostBottleneck, SPP, SPPF, DWConv, MixConv2d, Focus, CrossConv,
                  BottleneckCSP, C3, C3TR, C3SPP, C3Ghost, # below are from yolov7 modules

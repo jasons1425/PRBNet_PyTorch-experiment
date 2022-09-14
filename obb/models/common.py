@@ -42,10 +42,10 @@ def autopad(k, p=None):  # kernel, padding
 
 class Conv(nn.Module):
     # Standard convolution
-    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True):  # ch_in, ch_out, kernel, stride, padding, groups
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, gn=-1, act=True):  # ch_in, ch_out, kernel, stride, padding, conv groups, norm groups, activation
         super().__init__()
         self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=False)
-        self.bn = nn.BatchNorm2d(c2)
+        self.bn = nn.BatchNorm2d(c2) if gn <= 0 else nn.GroupNorm(gn, c2)
         self.act = nn.SiLU() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
 
     def forward(self, x):
@@ -57,17 +57,17 @@ class Conv(nn.Module):
 
 class DWConv(Conv):
     # Depth-wise convolution class
-    def __init__(self, c1, c2, k=1, s=1, act=True):  # ch_in, ch_out, kernel, stride, padding, groups
-        super().__init__(c1, c2, k, s, g=math.gcd(c1, c2), act=act)
+    def __init__(self, c1, c2, k=1, s=1, gn=-1, act=True):  # ch_in, ch_out, kernel, stride, norm groups, activation
+        super().__init__(c1, c2, k, s, g=math.gcd(c1, c2), gn=gn, act=act)
 
 
 class Bottleneck(nn.Module):
     # Standard bottleneck (Darknet bottleneck)
-    def __init__(self, c1, c2, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, shortcut, groups, expansion
+    def __init__(self, c1, c2, shortcut=True, g=1, e=0.5, gn=-1):  # ch_in, ch_out, shortcut, groups, expansion, norm groups
         super().__init__()
         c_ = int(c2 * e)  # hidden channels
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv(c_, c2, 3, 1, g=g)
+        self.cv1 = Conv(c1, c_, 1, 1, gn=gn)
+        self.cv2 = Conv(c_, c2, 3, 1, g=g, gn=gn)
         self.add = shortcut and c1 == c2
 
     def forward(self, x):
@@ -76,11 +76,11 @@ class Bottleneck(nn.Module):
 
 class SPP(nn.Module):
     # Spatial Pyramid Pooling (SPP) layer https://arxiv.org/abs/1406.4729
-    def __init__(self, c1, c2, k=(5, 9, 13)):
+    def __init__(self, c1, c2, k=(5, 9, 13), gn=-1):
         super().__init__()
         c_ = c1 // 2  # hidden channels
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv(c_ * (len(k) + 1), c2, 1, 1)
+        self.cv1 = Conv(c1, c_, 1, 1, gn=gn)
+        self.cv2 = Conv(c_ * (len(k) + 1), c2, 1, 1, gn=gn)
         self.m = nn.ModuleList([nn.MaxPool2d(kernel_size=x, stride=1, padding=x // 2) for x in k])
 
     def forward(self, x):
@@ -92,11 +92,11 @@ class SPP(nn.Module):
 
 class GhostConv(nn.Module):
     # Ghost Convolution https://github.com/huawei-noah/ghostnet
-    def __init__(self, c1, c2, k=1, s=1, g=1, act=True):  # ch_in, ch_out, kernel, stride, groups
+    def __init__(self, c1, c2, k=1, s=1, g=1, gn=-1, act=True):  # ch_in, ch_out, kernel, stride, groups
         super().__init__()
         c_ = c2 // 2  # hidden channels
-        self.cv1 = Conv(c1, c_, k, s, None, g, act)
-        self.cv2 = Conv(c_, c_, 5, 1, None, c_, act)
+        self.cv1 = Conv(c1, c_, k, s, None, g, act, gn=gn)
+        self.cv2 = Conv(c_, c_, 5, 1, None, c_, act, gn=gn)
 
     def forward(self, x):
         y = self.cv1(x)
@@ -105,14 +105,14 @@ class GhostConv(nn.Module):
 
 class GhostBottleneck(nn.Module):
     # Ghost Bottleneck https://github.com/huawei-noah/ghostnet
-    def __init__(self, c1, c2, k=3, s=1):  # ch_in, ch_out, kernel, stride
+    def __init__(self, c1, c2, k=3, s=1, gn=-1):  # ch_in, ch_out, kernel, stride
         super().__init__()
         c_ = c2 // 2
-        self.conv = nn.Sequential(GhostConv(c1, c_, 1, 1),  # pw
-                                  DWConv(c_, c_, k, s, act=False) if s == 2 else nn.Identity(),  # dw
-                                  GhostConv(c_, c2, 1, 1, act=False))  # pw-linear
-        self.shortcut = nn.Sequential(DWConv(c1, c1, k, s, act=False),
-                                      Conv(c1, c2, 1, 1, act=False)) if s == 2 else nn.Identity()
+        self.conv = nn.Sequential(GhostConv(c1, c_, 1, 1, gn=gn),  # pw
+                                  DWConv(c_, c_, k, s, gn=gn, act=False) if s == 2 else nn.Identity(),  # dw
+                                  GhostConv(c_, c2, 1, 1, gn=gn, act=False))  # pw-linear
+        self.shortcut = nn.Sequential(DWConv(c1, c1, k, s, gn=gn, act=False),
+                                      Conv(c1, c2, 1, 1, gn=gn, act=False)) if s == 2 else nn.Identity()
 
     def forward(self, x):
         return self.conv(x) + self.shortcut(x)
@@ -294,16 +294,16 @@ class Ghost(nn.Module):
 
 class BottleneckCSP(nn.Module):
     # CSP Bottleneck https://github.com/WongKinYiu/CrossStagePartialNetworks
-    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5, gn=-1):  # ch_in, ch_out, number, shortcut, groups, expansion
         super().__init__()
         c_ = int(c2 * e)  # hidden channels
-        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv1 = Conv(c1, c_, 1, 1, gn=gn)
         self.cv2 = nn.Conv2d(c1, c_, 1, 1, bias=False)
         self.cv3 = nn.Conv2d(c_, c_, 1, 1, bias=False)
-        self.cv4 = Conv(2 * c_, c2, 1, 1)
-        self.bn = nn.BatchNorm2d(2 * c_)  # applied to cat(cv2, cv3)
+        self.cv4 = Conv(2 * c_, c2, 1, 1, gn=gn)
+        self.bn = nn.BatchNorm2d(2 * c_)  if gn <= 0 else nn.GroupNorm(gn, 2 * c_) # applied to cat(cv2, cv3)
         self.act = nn.SiLU()
-        self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
+        self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, e=1.0, gn=gn) for _ in range(n)))
 
     def forward(self, x):
         y1 = self.cv3(self.m(self.cv1(x)))
@@ -353,17 +353,17 @@ class C3Ghost(C3):
 #--- from yolov7 ---#
 class SPPCSPC(nn.Module):
     # CSP https://github.com/WongKinYiu/CrossStagePartialNetworks
-    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5, k=(5, 9, 13)):
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5, k=(5, 9, 13), gn=-1):
         super(SPPCSPC, self).__init__()
         c_ = int(2 * c2 * e)  # hidden channels
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv(c1, c_, 1, 1)
-        self.cv3 = Conv(c_, c_, 3, 1)
-        self.cv4 = Conv(c_, c_, 1, 1)
+        self.cv1 = Conv(c1, c_, 1, 1, gn=gn)
+        self.cv2 = Conv(c1, c_, 1, 1, gn=gn)
+        self.cv3 = Conv(c_, c_, 3, 1, gn=gn)
+        self.cv4 = Conv(c_, c_, 1, 1, gn=gn)
         self.m = nn.ModuleList([nn.MaxPool2d(kernel_size=x, stride=1, padding=x // 2) for x in k])
-        self.cv5 = Conv(4 * c_, c_, 1, 1)
-        self.cv6 = Conv(c_, c_, 3, 1)
-        self.cv7 = Conv(2 * c_, c2, 1, 1)
+        self.cv5 = Conv(4 * c_, c_, 1, 1, gn=gn)
+        self.cv6 = Conv(c_, c_, 3, 1, gn=gn)
+        self.cv7 = Conv(2 * c_, c2, 1, 1, gn=gn)
 
     def forward(self, x):
         x1 = self.cv4(self.cv3(self.cv1(x)))
@@ -399,13 +399,13 @@ class GhostStem(Stem):
 
 class BottleneckCSPA(nn.Module):
     # CSP https://github.com/WongKinYiu/CrossStagePartialNetworks
-    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5, gn=-1):  # ch_in, ch_out, number, shortcut, groups, expansion
         super(BottleneckCSPA, self).__init__()
         c_ = int(c2 * e)  # hidden channels
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv(c1, c_, 1, 1)
-        self.cv3 = Conv(2 * c_, c2, 1, 1)
-        self.m = nn.Sequential(*[Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)])
+        self.cv1 = Conv(c1, c_, 1, 1, gn=gn)
+        self.cv2 = Conv(c1, c_, 1, 1, gn=gn)
+        self.cv3 = Conv(2 * c_, c2, 1, 1, gn=gn)
+        self.m = nn.Sequential(*[Bottleneck(c_, c_, shortcut, g, e=1.0, gn=gn) for _ in range(n)])
 
     def forward(self, x):
         y1 = self.m(self.cv1(x))
@@ -415,13 +415,13 @@ class BottleneckCSPA(nn.Module):
 
 class BottleneckCSPB(nn.Module):
     # CSP https://github.com/WongKinYiu/CrossStagePartialNetworks
-    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5, gn=-1):  # ch_in, ch_out, number, shortcut, groups, expansion
         super(BottleneckCSPB, self).__init__()
         c_ = int(c2)  # hidden channels
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv(c_, c_, 1, 1)
-        self.cv3 = Conv(2 * c_, c2, 1, 1)
-        self.m = nn.Sequential(*[Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)])
+        self.cv1 = Conv(c1, c_, 1, 1, gn=gn)
+        self.cv2 = Conv(c_, c_, 1, 1, gn=gn)
+        self.cv3 = Conv(2 * c_, c2, 1, 1, gn=gn)
+        self.m = nn.Sequential(*[Bottleneck(c_, c_, shortcut, g, e=1.0, gn=gn) for _ in range(n)])
 
     def forward(self, x):
         x1 = self.cv1(x)
@@ -432,14 +432,14 @@ class BottleneckCSPB(nn.Module):
 
 class BottleneckCSPC(nn.Module):
     # CSP https://github.com/WongKinYiu/CrossStagePartialNetworks
-    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5, gn=-1):  # ch_in, ch_out, number, shortcut, groups, expansion
         super(BottleneckCSPC, self).__init__()
         c_ = int(c2 * e)  # hidden channels
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv(c1, c_, 1, 1)
-        self.cv3 = Conv(c_, c_, 1, 1)
-        self.cv4 = Conv(2 * c_, c2, 1, 1)
-        self.m = nn.Sequential(*[Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)])
+        self.cv1 = Conv(c1, c_, 1, 1, gn=gn)
+        self.cv2 = Conv(c1, c_, 1, 1, gn=gn)
+        self.cv3 = Conv(c_, c_, 1, 1, gn=gn)
+        self.cv4 = Conv(2 * c_, c2, 1, 1, gn=gn)
+        self.m = nn.Sequential(*[Bottleneck(c_, c_, shortcut, g, e=1.0, gn=gn) for _ in range(n)])
 
     def forward(self, x):
         y1 = self.cv3(self.m(self.cv1(x)))
@@ -578,11 +578,11 @@ class Focus(nn.Module):
 
 class SPPF(nn.Module):
     # Spatial Pyramid Pooling - Fast (SPPF) layer for YOLOv5 by Glenn Jocher
-    def __init__(self, c1, c2, k=5):  # equivalent to SPP(k=(5, 9, 13))
+    def __init__(self, c1, c2, k=5, gn=-1):  # equivalent to SPP(k=(5, 9, 13))
         super().__init__()
         c_ = c1 // 2  # hidden channels
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv(c_ * 4, c2, 1, 1)
+        self.cv1 = Conv(c1, c_, 1, 1, gn=gn)
+        self.cv2 = Conv(c_ * 4, c2, 1, 1, gn=gn)
         self.m = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
 
     def forward(self, x):
@@ -2386,16 +2386,16 @@ class ST2CSPC(nn.Module):
 
 ##### PRB-FPN #####
 
-# Basic RBBlock
+# Basic RB Block
 class RBBlockA(nn.Module):
-    def __init__(self, in_cs, out_c, current, shallow, sf=2, mode="nearest"):
+    def __init__(self, in_cs, out_c, current, shallow, sf=2, mode="nearest", gn=-1):
         # in_cs = [current channel, shallow channel, deep channel]
         # current/shallow = [Conv size, kernel size, stride]
         super(RBBlockA, self).__init__()
-        self.up1 = nn.Upsample(size=None, scale_factor=sf, mode=mode) if sf > 1 else nn.Identity() # for deep layer (i+1)-th
-        self.cv1 = Conv(in_cs[0], *current)  # for current layer i-th
-        self.cv2 = Conv(in_cs[1], *shallow)  # for shallow layer (i-1)-th
-        self.out_cv = Conv(current[0] + shallow[0] + in_cs[2], out_c, 1, 1)
+        self.up1 = nn.Upsample(size=None, scale_factor=sf, mode=mode) if sf > 1 else nn.Identity()  # for deep layer (i+1)-th
+        self.cv1 = Conv(in_cs[0], *current, gn=gn)  # for current layer i-th
+        self.cv2 = Conv(in_cs[1], *shallow, gn=gn)  # for shallow layer (i-1)-th
+        self.out_cv = Conv(current[0] + shallow[0] + in_cs[2], out_c, 1, 1, gn=gn)
     
     # x = [current layer, shallow layer, deep layer]
     def forward(self, x):
@@ -2408,14 +2408,14 @@ class RBBlockA(nn.Module):
 
 # RB Block with conv for deep layer
 class RBBlockB(nn.Module):
-    def __init__(self, in_cs, out_c, current, shallow, deep, sf=2, mode="nearest"):
+    def __init__(self, in_cs, out_c, current, shallow, deep, sf=2, mode="nearest", gn=-1):
         # current/shallow/deep = [Conv size, kernel size, stride]
         super(RBBlockB, self).__init__()
         self.up1 = nn.Upsample(size=None, scale_factor=sf, mode=mode) if sf > 1 else nn.Identity()  # for deep layer (i+1)-th
-        self.cv1 = Conv(in_cs[0], *current)  # for current layer i-th
-        self.cv2 = Conv(in_cs[1], *shallow)  # for shallow layer (i-1)-th
-        self.cv3 = Conv(in_cs[2], *deep)  # for deep layer (i+1)-th
-        self.out_cv = Conv(current[0] + shallow[0] + deep[0], out_c, 1, 1)
+        self.cv1 = Conv(in_cs[0], *current, gn=gn)  # for current layer i-th
+        self.cv2 = Conv(in_cs[1], *shallow, gn=gn)  # for shallow layer (i-1)-th
+        self.cv3 = Conv(in_cs[2], *deep, gn=gn)  # for deep layer (i+1)-th
+        self.out_cv = Conv(current[0] + shallow[0] + deep[0], out_c, 1, 1, gn=gn)
     
     # x = [current layer, shallow layer, deep layer]
     def forward(self, x):
@@ -2427,15 +2427,15 @@ class RBBlockB(nn.Module):
 
 
 class BFM(nn.Module):
-    def __init__(self, in_cs, out_c, fe_a, fe_b):
+    def __init__(self, in_cs, out_c, fe_a, fe_b, gn=-1):
         # fe_a = scale_i fe_b = scale_i-1 
         # fe_a/fe_b = [Conv size, kernel size, stride]
         super(BFM, self).__init__()
         self.reorg = ReOrg()  # for FE Scale (i)-th
         # Conv( ch_in, (ch_out, kernel, stride) )
-        self.cv1 = Conv(in_cs[0]*4, *fe_a)  # for FE Scale (i)-th after ReOrg 
-        self.cv2 = Conv(in_cs[1], *fe_b)  # for FE Scale (i-1)-th
-        self.out_cv = Conv(fe_a[0] + fe_b[0], out_c, 1, 1)
+        self.cv1 = Conv(in_cs[0]*4, *fe_a, gn=gn)  # for FE Scale (i)-th after ReOrg 
+        self.cv2 = Conv(in_cs[1], *fe_b, gn=gn)  # for FE Scale (i-1)-th
+        self.out_cv = Conv(fe_a[0] + fe_b[0], out_c, 1, 1, gn=gn)
 
     # x = [FE_i, FE_i-1]
     def forward(self, x):
@@ -2446,14 +2446,14 @@ class BFM(nn.Module):
 
 
 class BFMBlockB(nn.Module):
-    def __init__(self, in_cs, out_c, fe_a, fe_b):
+    def __init__(self, in_cs, out_c, fe_a, fe_b, gn=-1):
         # fe_a = scale_i fe_b = scale_i-1 
         # fe_a/fe_b = [Conv size, kernel size, stride]
         super(BFMBlockB, self).__init__()
         # Conv( ch_in, (ch_out, kernel, stride) )
-        self.cv1 = Conv(in_cs[0], *fe_a)  # for FE Scale (i)-th after stride 2 
-        self.cv2 = Conv(in_cs[1], *fe_b)  # for FE Scale (i-1)-th
-        self.out_cv = Conv(fe_a[0] + fe_b[0], out_c, 1, 1)
+        self.cv1 = Conv(in_cs[0], *fe_a, gn=gn)  # for FE Scale (i)-th after stride 2 
+        self.cv2 = Conv(in_cs[1], *fe_b, gn=gn)  # for FE Scale (i-1)-th
+        self.out_cv = Conv(fe_a[0] + fe_b[0], out_c, 1, 1, gn=gn)
     
     # x = [FE_i, FE_i-1]
     def forward(self, x):
